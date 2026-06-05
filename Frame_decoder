@@ -1,0 +1,471 @@
+-- Short description of code
+-- Every 4 clock cycles we receive 128 bits (a full 16 byte frame) that must be decoded.
+-- It must be decoded in 4 cycles to make sure we are "ready" to receive the next frame.
+-- The first cycle is done in IDLE state once the ready signal has been received.
+-- The IDLE state only decodes 3 bytes of data, since it has to take data directly from the input wires.
+-- The other 3 states decode 4 bytes each, these use data in a shift register that acts as a "snapshot" of the data when ready was 1.
+-- Each state/clockcycle has 4 "channels", essentially it contains 4 bytes of data, 4 ID's and 4 valid signals.
+-- This ensures the next block knows which data belong to which ID, and if the data is valid or not.
+-- When decoding 3-4 bytes, we know that 2 of the bytes are either "DATA or ID", these are the "even number bytes" such as byte 0,2,4,6,8,10,12,14. The "odd" bytes are always DATA.
+-- These even number bytes are ID if it's 0th bit is 1, or Data if the 0th bit is 0.
+-- If it is an ID, the auxiliary bit corresponding to it tells us if this ID is delayed 1 byte. If the aux bit is 0, then it is not delayed and the ID change take effect immediately at the next data byte.
+-- Due to this protocol-logic, we create a case statement that handles the checking for ID or data, and deals with the logic for each case.
+-- The most "messy" logic to grasp in this code would be "new_id" and "old_id"
+-- "New_ID" refer to the last ID we had, however it is possible that this ID had it's aux bit set so that the ID change is delayed by 1 byte.
+-- This means that if our 4 byte word starts at a DATA byte instead of an ID byte, and NEW_ID was delayed, we must apply old_id to just the first DATA byte, after that the old_id can be forgotten completely.
+-- This logic then repeats itself for each state/cycle, so we must save the latest ID into NEW_ID along with the aux bit to know if it is delayed or not, we also must save the ID previous to that in the case that NEW_ID is delayed.
+
+
+-- ============================================================
+-- frame_deformatter.vhd
+-- ARM CoreSight Frame Deformatter
+-- Decodes 128-bit frames into 4 x 16-bit channel outputs
+-- ============================================================
+
+-- Standard IEEE libraries for digital logic and numeric operations
+library IEEE;                                                    -- Import the IEEE standard library collection
+use IEEE.STD_LOGIC_1164.ALL;                                     -- Use standard logic types: STD_LOGIC, STD_LOGIC_VECTOR
+
+-- ============================================================
+-- PACKAGE: frame_types
+-- Defines custom data types shared across the deformatter
+-- ============================================================
+package frame_types is
+
+    -- Record type combining 8-bit data and 7-bit ID into one named structure
+    type channel_t is record
+        data  : std_logic_vector(7 downto 0);                    -- 8-bit data payload for this channel
+        id    : std_logic_vector(6 downto 0);                    -- 7-bit channel identifier (which trace source this belongs to)
+    end record;
+
+    -- Array of 4 channel_t records, one for each output channel (Chan0..Chan3)
+    type channel_array is array (0 to 3) of channel_t;
+
+    -- A constant representing an empty/invalid channel (all zeros for both data and id)
+    constant NULL_CHAN : channel_t := (data => (others => '0'), id => (others => '0'));
+
+    -- Vivado block diagrams cannot use record types on ports
+    -- This function converts the internal record to a plain 16-bit std_logic_vector
+    function to_vector(c : channel_t) return std_logic_vector;   -- Declaration of conversion function
+
+end package;
+
+-- Package body: contains the actual implementation of functions declared above
+package body frame_types is
+
+    function to_vector(c : channel_t) return std_logic_vector is -- Function takes a channel_t record as input
+    begin
+        -- Concatenate: [8-bit data] & ['0' valid bit, hardcoded off] & [7-bit ID]
+        -- Result is 16 bits: bits[15:8]=data, bit[7]=0 (unused valid), bits[6:0]=ID
+        return c.data & '0' & c.id;                              -- Pack record fields into a 16-bit vector for the output port
+    end function;
+
+end package body;
+
+-- ============================================================
+-- ENTITY: frame_deformatter
+-- Defines the external interface (ports) of the block
+-- ============================================================
+library IEEE;                                                    -- Re-import IEEE (required for each design unit)
+use IEEE.STD_LOGIC_1164.ALL;                                     -- Re-use standard logic types
+use work.frame_types.all;                                        -- Import our custom types defined in the package above
+
+entity frame_decoder is
+    Port (
+        ACLK      : in  STD_LOGIC;                               -- Main clock: all logic triggers on the rising edge of this
+        ARESETN   : in  STD_LOGIC;                               -- Active-low reset: when '0', all registers are cleared
+        Frame_in  : in  STD_LOGIC_VECTOR (127 downto 0);         -- 128-bit input frame (16 bytes) from frame_generator
+        rd_en     : in  STD_LOGIC;                               -- Read enable: pulsed HIGH for 1 cycle when a new frame is ready
+
+        -- Output channels: each is [Data(8) | '0' | ID(7)] = 16 bits total
+        Chan0     : out STD_LOGIC_VECTOR (15 downto 0);          -- Channel 0 decoded output
+        Chan1     : out STD_LOGIC_VECTOR (15 downto 0);          -- Channel 1 decoded output
+        Chan2     : out STD_LOGIC_VECTOR (15 downto 0);          -- Channel 2 decoded output
+        Chan3     : out STD_LOGIC_VECTOR (15 downto 0)           -- Channel 3 decoded output
+    );
+end frame_decoder;
+
+-- ============================================================
+-- ARCHITECTURE: Behavioral implementation
+-- ============================================================
+architecture Behavioral of frame_decoder is
+
+    -- FSM states: one IDLE + three decode cycles to spread logic across 4 clock cycles
+    type state_type is (IDLE, CYCLE_A, CYCLE_B, CYCLE_C);        -- Define 4 FSM states
+    signal state : state_type := IDLE;                           -- Current FSM state, starts in IDLE after power-on
+
+    -- ID tracking: the protocol allows IDs to be delayed by 1 byte
+    signal new_id          : std_logic_vector(6 downto 0) := (others => '0'); -- Most recently seen ID value
+    signal old_id          : std_logic_vector(6 downto 0) := (others => '0'); -- Previous ID (used when new_id is delayed)
+    signal NewID_isDelayed : std_logic := '0';                   -- Flag: '1' means new_id takes effect 1 byte later than normal
+    signal error           : std_logic := '0';                   -- Error flag: set '1' if undefined signal values detected
+
+    -- Byte arrays to hold the 15 data bytes extracted from the 128-bit frame
+    type byte_array is array (0 to 14) of std_logic_vector(7 downto 0); -- Array type: 15 entries of 8 bits each
+    signal bytes_w  : byte_array;                                -- Wire version: directly connected to Frame_in input (combinational)
+    signal bytes_r  : byte_array;                                -- Register version: snapshot of bytes_w taken on rd_en pulse
+
+    -- 8 auxiliary bits extracted from the top byte of the frame (Frame_in[127:120])
+    signal auxiliary_w : std_logic_vector(7 downto 0);           -- Wire: directly from Frame_in top byte
+    signal auxiliary_r : std_logic_vector(7 downto 0);           -- Register: snapshot taken on rd_en pulse
+
+    -- Internal channel registers: hold decoded data+id for all 4 channels
+    signal chan_regs : channel_array := (others => NULL_CHAN);    -- Initialise all 4 channels to NULL (zeros)
+
+begin
+
+    -- --------------------------------------------------------
+    -- OUTPUT ASSIGNMENTS: drive ports from internal registers
+    -- These are combinational (no clock needed)
+    -- --------------------------------------------------------
+    Chan0 <= to_vector(chan_regs(0));                             -- Convert channel 0 record to 16-bit vector and drive Chan0 port
+    Chan1 <= to_vector(chan_regs(1));                             -- Convert channel 1 record to 16-bit vector and drive Chan1 port
+    Chan2 <= to_vector(chan_regs(2));                             -- Convert channel 2 record to 16-bit vector and drive Chan2 port
+    Chan3 <= to_vector(chan_regs(3));                             -- Convert channel 3 record to 16-bit vector and drive Chan3 port
+
+    -- Extract auxiliary byte: top 8 bits of frame = Frame_in[127:120]
+    -- These bits are used as auxiliary/delay flags for each even-numbered byte
+    auxiliary_w <= Frame_in(127 downto 120);                     -- Wire auxiliary_w directly to the top byte of the input frame
+
+    -- Extract 15 data bytes from the 128-bit frame using a generate loop
+    -- Byte 0 = bits[7:0], Byte 1 = bits[15:8], ..., Byte 14 = bits[119:112]
+    gen_mapping: for i in 0 to 14 generate                       -- Loop from byte index 0 to 14
+        bytes_w(i) <= Frame_in((i*8)+7 downto i*8);              -- Each byte is 8 bits starting at bit position i*8
+    end generate;
+
+    -- --------------------------------------------------------
+    -- MAIN CLOCKED PROCESS
+    -- All state transitions and register updates happen here
+    -- --------------------------------------------------------
+    process(ACLK)
+        variable v_selector : std_logic_vector(1 downto 0);      -- Temporary 2-bit variable to select the decode case each cycle
+    begin
+        if rising_edge(ACLK) then                                -- All logic is synchronous: only execute on rising clock edge
+
+            if ARESETN = '0' then                                -- Active-low reset: ARESETN='0' means reset is asserted
+                state          <= IDLE;                          -- Return FSM to starting state
+                chan_regs      <= (others => NULL_CHAN);          -- Clear all 4 output channel registers to zero
+                new_id         <= (others => '0');               -- Clear the current ID tracker
+                old_id         <= (others => '0');               -- Clear the previous ID tracker
+                NewID_isDelayed <= '0';                          -- Clear the delayed-ID flag
+                error          <= '0';                           -- Clear the error flag
+
+            else
+                -- Normal operation: run the state machine
+                case state is
+
+                    -- ============================================
+                    -- IDLE STATE
+                    -- Waits for rd_en=1, then:
+                    --   1) Snapshots frame into bytes_r/auxiliary_r
+                    --   2) Decodes first 3 bytes (0, 1, 2)
+                    --   3) Clears Chan3 (only 3 bytes available)
+                    --   4) Transitions to CYCLE_A
+                    -- ============================================
+                    when IDLE =>
+                        if rd_en = '1' then                      -- Wait here until frame_generator signals a new frame is ready
+
+                            bytes_r     <= bytes_w;              -- Snapshot all 15 bytes from input into registers for stable access in next 3 cycles
+                            auxiliary_r <= auxiliary_w;          -- Snapshot the 8 auxiliary bits as well
+
+                            chan_regs(3) <= NULL_CHAN;            -- Chan3 is always cleared in IDLE because only 3 bytes are decoded here
+
+                            -- Build 2-bit selector from LSB of even bytes 2 and 0
+                            -- bit0=1 means that byte is an ID, bit0=0 means it is DATA
+                            v_selector := bytes_w(2)(0) & bytes_w(0)(0); -- MSB=byte2 LSB indicator, LSB=byte0 LSB indicator
+
+                            case v_selector is
+
+                                -- "00": byte0=DATA, byte2=DATA (no IDs in this group)
+                                when "00" =>
+                                    if NewID_isDelayed = '0' then            -- Was the previous ID delayed?
+                                        chan_regs(0) <= (data => (bytes_w(0)(7 downto 1) & auxiliary_w(0)), id => new_id); -- No delay: use current new_id
+                                    else
+                                        chan_regs(0) <= (data => (bytes_w(0)(7 downto 1) & auxiliary_w(0)), id => old_id); -- Delayed: use old_id for this one byte
+                                        NewID_isDelayed <= '0';              -- Clear delay flag - it only lasts for one data byte
+                                    end if;
+                                    chan_regs(1) <= (data => bytes_w(1), id => new_id);                                    -- Byte1 is always DATA, assign current ID
+                                    chan_regs(2) <= (data => (bytes_w(2)(7 downto 1) & auxiliary_w(1)), id => new_id);    -- Byte2 is DATA: shift out LSB, fill with aux(1)
+
+                                -- "01": byte0=ID, byte2=DATA
+                                when "01" =>
+                                    chan_regs(0) <= NULL_CHAN;               -- Byte0 is an ID byte, not data - null this channel
+                                    if auxiliary_w(0) = '0' then            -- aux(0)=0 means byte0 ID is immediate (not delayed)
+                                        chan_regs(1) <= (data => bytes_w(1), id => bytes_w(0)(7 downto 1)); -- Use byte0 as ID for byte1
+                                    else
+                                        chan_regs(1) <= (data => bytes_w(1), id => new_id);                 -- Byte0 ID is delayed - use previous ID for byte1
+                                    end if;
+                                    chan_regs(2) <= (data => (bytes_w(2)(7 downto 1) & auxiliary_w(1)), id => bytes_w(0)(7 downto 1)); -- Byte2 always gets byte0's ID
+                                    old_id <= new_id;                        -- Save current ID as old before overwriting
+                                    new_id <= bytes_w(0)(7 downto 1);        -- Byte0 bits[7:1] become the new current ID
+                                    NewID_isDelayed <= '0';                  -- Already processed byte past the new ID, so delay is cleared
+
+                                -- "10": byte0=DATA, byte2=ID
+                                when "10" =>
+                                    chan_regs(2) <= NULL_CHAN;               -- Byte2 is an ID byte, not data - null this channel
+                                    if NewID_isDelayed = '0' then            -- Was previous ID delayed?
+                                        chan_regs(0) <= (data => (bytes_w(0)(7 downto 1) & auxiliary_w(0)), id => new_id); -- No delay: use new_id
+                                    else
+                                        chan_regs(0) <= (data => (bytes_w(0)(7 downto 1) & auxiliary_w(0)), id => old_id); -- Delayed: use old_id
+                                    end if;
+                                    chan_regs(1) <= (data => bytes_w(1), id => new_id);                    -- Byte1 is DATA with current ID
+                                    old_id <= new_id;                        -- Save current ID as old
+                                    new_id <= bytes_w(2)(7 downto 1);        -- Byte2 bits[7:1] become the new current ID
+                                    NewID_isDelayed <= auxiliary_w(1);       -- aux(1) tells us if this new ID is delayed by 1 byte
+
+                                -- "11": byte0=ID, byte2=ID (both even bytes are IDs)
+                                when "11" =>
+                                    chan_regs(0) <= NULL_CHAN;               -- Byte0 is ID - null channel 0
+                                    chan_regs(2) <= NULL_CHAN;               -- Byte2 is ID - null channel 2
+                                    if auxiliary_w(0) = '0' then            -- Is byte0 ID immediate?
+                                        chan_regs(1) <= (data => bytes_w(1), id => bytes_w(0)(7 downto 1)); -- Use byte0 as ID for byte1
+                                    else
+                                        chan_regs(1) <= (data => bytes_w(1), id => new_id);                 -- Byte0 ID is delayed - use previous ID
+                                    end if;
+                                    old_id <= bytes_w(0)(7 downto 1);        -- Byte0 becomes old_id (needed if byte2 ID is delayed)
+                                    new_id <= bytes_w(2)(7 downto 1);        -- Byte2 becomes new_id
+                                    NewID_isDelayed <= auxiliary_w(1);       -- aux(1) tells if byte2 ID is delayed
+
+                                when others => error <= '1';                 -- Undefined logic values (X/Z/U) - set error flag
+                            end case;
+
+                        state <= CYCLE_A;                                    -- Always move to CYCLE_A after IDLE (whether rd_en was 1 or not)
+                        end if;
+
+                    -- ============================================
+                    -- CYCLE_A STATE
+                    -- Decodes bytes 3, 4, 5, 6 (second group of 4)
+                    -- Uses registered snapshot bytes_r/auxiliary_r
+                    -- ============================================
+                    when CYCLE_A =>
+                        v_selector := bytes_r(6)(0) & bytes_r(4)(0);        -- Check LSB of even bytes 6 and 4 to determine ID vs DATA
+
+                        case v_selector is
+
+                            -- "00": byte4=DATA, byte6=DATA
+                            when "00" =>
+                                if NewID_isDelayed = '0' then                -- Was previous ID delayed?
+                                    chan_regs(0) <= (data => bytes_r(3), id => new_id);                                   -- Byte3 is DATA with new_id
+                                else
+                                    chan_regs(0) <= (data => bytes_r(3), id => old_id);                                   -- Delayed: byte3 gets old_id
+                                    NewID_isDelayed <= '0';                  -- Delay only lasts one byte, clear it
+                                end if;
+                                chan_regs(1) <= (data => (bytes_r(4)(7 downto 1) & auxiliary_r(2)), id => new_id);        -- Byte4 is DATA: shift bits, fill with aux(2)
+                                chan_regs(2) <= (data => bytes_r(5), id => new_id);                                       -- Byte5 is always DATA with current ID
+                                chan_regs(3) <= (data => (bytes_r(6)(7 downto 1) & auxiliary_r(3)), id => new_id);        -- Byte6 is DATA: shift bits, fill with aux(3)
+
+                            -- "01": byte4=ID, byte6=DATA
+                            when "01" =>
+                                chan_regs(1) <= NULL_CHAN;                    -- Byte4 is an ID byte - null channel 1
+                                if NewID_isDelayed = '0' then                -- Was previous ID delayed?
+                                    chan_regs(0) <= (data => bytes_r(3), id => new_id);                                   -- No delay: byte3 gets new_id
+                                else
+                                    chan_regs(0) <= (data => bytes_r(3), id => old_id);                                   -- Delayed: byte3 gets old_id
+                                end if;
+                                if auxiliary_r(2) = '0' then                 -- Is byte4 ID immediate?
+                                    chan_regs(2) <= (data => bytes_r(5), id => bytes_r(4)(7 downto 1));                   -- Immediate: byte5 uses byte4 as ID
+                                else
+                                    chan_regs(2) <= (data => bytes_r(5), id => new_id);                                   -- Delayed: byte5 still uses previous new_id
+                                end if;
+                                chan_regs(3) <= (data => bytes_r(6)(7 downto 1) & auxiliary_r(3), id => bytes_r(4)(7 downto 1)); -- Byte6 DATA with byte4 as ID
+                                old_id <= new_id;                            -- Save current ID
+                                new_id <= bytes_r(4)(7 downto 1);            -- Byte4 bits[7:1] become new current ID
+                                NewID_isDelayed <= '0';                      -- Already past delayed byte, clear flag
+
+                            -- "10": byte4=DATA, byte6=ID
+                            when "10" =>
+                                chan_regs(3) <= NULL_CHAN;                    -- Byte6 is an ID byte - null channel 3
+                                if NewID_isDelayed = '0' then                -- Was previous ID delayed?
+                                    chan_regs(0) <= (data => bytes_r(3), id => new_id);                                   -- No delay: byte3 uses new_id
+                                else
+                                    chan_regs(0) <= (data => bytes_r(3), id => old_id);                                   -- Delayed: byte3 uses old_id
+                                end if;
+                                chan_regs(1) <= (data => bytes_r(4)(7 downto 1) & auxiliary_r(2), id => new_id);          -- Byte4 DATA with current ID
+                                chan_regs(2) <= (data => bytes_r(5), id => new_id);                                       -- Byte5 DATA with current ID
+                                old_id <= new_id;                            -- Save current ID
+                                new_id <= bytes_r(6)(7 downto 1);            -- Byte6 bits[7:1] become new current ID
+                                NewID_isDelayed <= auxiliary_r(3);           -- aux(3) tells if byte6 ID is delayed
+
+                            -- "11": byte4=ID, byte6=ID
+                            when "11" =>
+                                chan_regs(1) <= NULL_CHAN;                    -- Byte4 is ID - null channel 1
+                                chan_regs(3) <= NULL_CHAN;                    -- Byte6 is ID - null channel 3
+                                if NewID_isDelayed = '0' then                -- Was previous ID delayed?
+                                    chan_regs(0) <= (data => bytes_r(3), id => new_id);                                   -- No delay: byte3 gets new_id
+                                else
+                                    chan_regs(0) <= (data => bytes_r(3), id => old_id);                                   -- Delayed: byte3 gets old_id
+                                end if;
+                                if auxiliary_r(2) = '0' then                 -- Is byte4 ID immediate?
+                                    chan_regs(2) <= (data => bytes_r(5), id => bytes_r(4)(7 downto 1));                   -- Immediate: byte5 uses byte4 as ID
+                                else
+                                    chan_regs(2) <= (data => bytes_r(5), id => new_id);                                   -- Delayed: byte5 uses previous new_id
+                                end if;
+                                old_id <= bytes_r(4)(7 downto 1);            -- Byte4 becomes old_id
+                                new_id <= bytes_r(6)(7 downto 1);            -- Byte6 becomes new_id
+                                NewID_isDelayed <= auxiliary_r(3);           -- aux(3) tells if byte6 ID is delayed
+
+                            when others => error <= '1';                     -- Undefined logic values - set error flag
+                        end case;
+                        state <= CYCLE_B;                                    -- Move to next decode cycle
+
+                    -- ============================================
+                    -- CYCLE_B STATE
+                    -- Decodes bytes 7, 8, 9, 10 (third group of 4)
+                    -- Same logic pattern as CYCLE_A, different byte indices
+                    -- ============================================
+                    when CYCLE_B =>
+                        v_selector := bytes_r(10)(0) & bytes_r(8)(0);       -- Check LSB of even bytes 10 and 8
+
+                        case v_selector is
+
+                            -- "00": byte8=DATA, byte10=DATA
+                            when "00" =>
+                                if NewID_isDelayed = '0' then
+                                    chan_regs(0) <= (data => bytes_r(7), id => new_id);                                   -- Byte7 DATA with new_id
+                                else
+                                    chan_regs(0) <= (data => bytes_r(7), id => old_id);                                   -- Delayed: byte7 gets old_id
+                                    NewID_isDelayed <= '0';                  -- Clear delay flag
+                                end if;
+                                chan_regs(1) <= (data => (bytes_r(8)(7 downto 1) & auxiliary_r(4)), id => new_id);        -- Byte8 DATA: shift bits, fill with aux(4)
+                                chan_regs(2) <= (data => bytes_r(9), id => new_id);                                       -- Byte9 always DATA
+                                chan_regs(3) <= (data => (bytes_r(10)(7 downto 1) & auxiliary_r(5)), id => new_id);       -- Byte10 DATA: shift bits, fill with aux(5)
+
+                            -- "01": byte8=ID, byte10=DATA
+                            when "01" =>
+                                chan_regs(1) <= NULL_CHAN;                    -- Byte8 is ID - null channel 1
+                                if NewID_isDelayed = '0' then
+                                    chan_regs(0) <= (data => bytes_r(7), id => new_id);                                   -- Byte7 DATA with new_id
+                                else
+                                    chan_regs(0) <= (data => bytes_r(7), id => old_id);                                   -- Delayed: byte7 gets old_id
+                                end if;
+                                if auxiliary_r(4) = '0' then                 -- Is byte8 ID immediate?
+                                    chan_regs(2) <= (data => bytes_r(9), id => bytes_r(8)(7 downto 1));                   -- Immediate: byte9 uses byte8 as ID
+                                else
+                                    chan_regs(2) <= (data => bytes_r(9), id => new_id);                                   -- Delayed: byte9 uses previous new_id
+                                end if;
+                                chan_regs(3) <= (data => bytes_r(10)(7 downto 1) & auxiliary_r(5), id => bytes_r(8)(7 downto 1)); -- Byte10 DATA, byte8 as ID
+                                old_id <= new_id;                            -- Save current ID
+                                new_id <= bytes_r(8)(7 downto 1);            -- Byte8 becomes new current ID
+                                NewID_isDelayed <= '0';                      -- Clear delay flag
+
+                            -- "10": byte8=DATA, byte10=ID
+                            when "10" =>
+                                chan_regs(3) <= NULL_CHAN;                    -- Byte10 is ID - null channel 3
+                                if NewID_isDelayed = '0' then
+                                    chan_regs(0) <= (data => bytes_r(7), id => new_id);                                   -- Byte7 DATA with new_id
+                                else
+                                    chan_regs(0) <= (data => bytes_r(7), id => old_id);                                   -- Delayed: byte7 gets old_id
+                                end if;
+                                chan_regs(1) <= (data => bytes_r(8)(7 downto 1) & auxiliary_r(4), id => new_id);          -- Byte8 DATA with current ID
+                                chan_regs(2) <= (data => bytes_r(9), id => new_id);                                       -- Byte9 DATA with current ID
+                                old_id <= new_id;                            -- Save current ID
+                                new_id <= bytes_r(10)(7 downto 1);           -- Byte10 becomes new current ID
+                                NewID_isDelayed <= auxiliary_r(5);           -- aux(5) tells if byte10 ID is delayed
+
+                            -- "11": byte8=ID, byte10=ID
+                            when "11" =>
+                                chan_regs(1) <= NULL_CHAN;                    -- Byte8 is ID - null channel 1
+                                chan_regs(3) <= NULL_CHAN;                    -- Byte10 is ID - null channel 3
+                                if NewID_isDelayed = '0' then
+                                    chan_regs(0) <= (data => bytes_r(7), id => new_id);                                   -- Byte7 DATA with new_id
+                                else
+                                    chan_regs(0) <= (data => bytes_r(7), id => old_id);                                   -- Delayed: byte7 gets old_id
+                                end if;
+                                if auxiliary_r(4) = '0' then                 -- Is byte8 ID immediate?
+                                    chan_regs(2) <= (data => bytes_r(9), id => bytes_r(8)(7 downto 1));                   -- Immediate: byte9 uses byte8 as ID
+                                else
+                                    chan_regs(2) <= (data => bytes_r(9), id => new_id);                                   -- Delayed: byte9 uses previous new_id
+                                end if;
+                                old_id <= bytes_r(8)(7 downto 1);            -- Byte8 becomes old_id
+                                new_id <= bytes_r(10)(7 downto 1);           -- Byte10 becomes new_id
+                                NewID_isDelayed <= auxiliary_r(5);           -- aux(5) tells if byte10 ID is delayed
+
+                            when others => error <= '1';                     -- Undefined logic values - set error flag
+                        end case;
+                        state <= CYCLE_C;                                    -- Move to final decode cycle
+
+                    -- ============================================
+                    -- CYCLE_C STATE
+                    -- Decodes bytes 11, 12, 13, 14 (final group)
+                    -- Same logic as CYCLE_A/B, then returns to IDLE
+                    -- ============================================
+                    when CYCLE_C =>
+                        v_selector := bytes_r(14)(0) & bytes_r(12)(0);      -- Check LSB of even bytes 14 and 12
+
+                        case v_selector is
+
+                            -- "00": byte12=DATA, byte14=DATA
+                            when "00" =>
+                                if NewID_isDelayed = '0' then
+                                    chan_regs(0) <= (data => bytes_r(11), id => new_id);                                  -- Byte11 DATA with new_id
+                                else
+                                    chan_regs(0) <= (data => bytes_r(11), id => old_id);                                  -- Delayed: byte11 gets old_id
+                                    NewID_isDelayed <= '0';                  -- Clear delay flag
+                                end if;
+                                chan_regs(1) <= (data => (bytes_r(12)(7 downto 1) & auxiliary_r(6)), id => new_id);       -- Byte12 DATA: shift bits, fill with aux(6)
+                                chan_regs(2) <= (data => bytes_r(13), id => new_id);                                      -- Byte13 always DATA
+                                chan_regs(3) <= (data => (bytes_r(14)(7 downto 1) & auxiliary_r(7)), id => new_id);       -- Byte14 DATA: shift bits, fill with aux(7)
+
+                            -- "01": byte12=ID, byte14=DATA
+                            when "01" =>
+                                chan_regs(1) <= NULL_CHAN;                    -- Byte12 is ID - null channel 1
+                                if NewID_isDelayed = '0' then
+                                    chan_regs(0) <= (data => bytes_r(11), id => new_id);                                  -- Byte11 DATA with new_id
+                                else
+                                    chan_regs(0) <= (data => bytes_r(11), id => old_id);                                  -- Delayed: byte11 gets old_id
+                                end if;
+                                if auxiliary_r(6) = '0' then                 -- Is byte12 ID immediate?
+                                    chan_regs(2) <= (data => bytes_r(13), id => bytes_r(12)(7 downto 1));                 -- Immediate: byte13 uses byte12 as ID
+                                else
+                                    chan_regs(2) <= (data => bytes_r(13), id => new_id);                                  -- Delayed: byte13 uses previous new_id
+                                end if;
+                                chan_regs(3) <= (data => bytes_r(14)(7 downto 1) & auxiliary_r(7), id => bytes_r(12)(7 downto 1)); -- Byte14 DATA, byte12 as ID
+                                old_id <= new_id;                            -- Save current ID
+                                new_id <= bytes_r(12)(7 downto 1);           -- Byte12 becomes new current ID
+                                NewID_isDelayed <= '0';                      -- Clear delay flag
+
+                            -- "10": byte12=DATA, byte14=ID
+                            when "10" =>
+                                chan_regs(3) <= NULL_CHAN;                    -- Byte14 is ID - null channel 3
+                                if NewID_isDelayed = '0' then
+                                    chan_regs(0) <= (data => bytes_r(11), id => new_id);                                  -- Byte11 DATA with new_id
+                                else
+                                    chan_regs(0) <= (data => bytes_r(11), id => old_id);                                  -- Delayed: byte11 gets old_id
+                                end if;
+                                chan_regs(1) <= (data => bytes_r(12)(7 downto 1) & auxiliary_r(6), id => new_id);         -- Byte12 DATA with current ID
+                                chan_regs(2) <= (data => bytes_r(13), id => new_id);                                      -- Byte13 DATA with current ID
+                                old_id <= new_id;                            -- Save current ID
+                                new_id <= bytes_r(14)(7 downto 1);           -- Byte14 becomes new current ID
+                                NewID_isDelayed <= auxiliary_r(7);           -- aux(7) tells if byte14 ID is delayed
+
+                            -- "11": byte12=ID, byte14=ID
+                            when "11" =>
+                                chan_regs(1) <= NULL_CHAN;                    -- Byte12 is ID - null channel 1
+                                chan_regs(3) <= NULL_CHAN;                    -- Byte14 is ID - null channel 3
+                                if NewID_isDelayed = '0' then
+                                    chan_regs(0) <= (data => bytes_r(11), id => new_id);                                  -- Byte11 DATA with new_id
+                                else
+                                    chan_regs(0) <= (data => bytes_r(11), id => old_id);                                  -- Delayed: byte11 gets old_id
+                                end if;
+                                if auxiliary_r(6) = '0' then                 -- Is byte12 ID immediate?
+                                    chan_regs(2) <= (data => bytes_r(13), id => bytes_r(12)(7 downto 1));                 -- Immediate: byte13 uses byte12 as ID
+                                else
+                                    chan_regs(2) <= (data => bytes_r(13), id => new_id);                                  -- Delayed: byte13 uses previous new_id
+                                end if;
+                                old_id <= bytes_r(12)(7 downto 1);           -- Byte12 becomes old_id
+                                new_id <= bytes_r(14)(7 downto 1);           -- Byte14 becomes new_id
+                                NewID_isDelayed <= auxiliary_r(7);           -- aux(7) tells if byte14 ID is delayed
+
+                            when others => error <= '1';                     -- Undefined logic values - set error flag
+                        end case;
+                        state <= IDLE;                                       -- Decoding complete - return to IDLE to wait for next frame
+
+                    -- Safe fallback: if FSM somehow enters an unknown state, return to IDLE
+                    when others => state <= IDLE;                            -- Should never happen, but prevents synthesis latch
+
+                end case;
+            end if;
+        end if;
+    end process;
+
+end Behavioral;
