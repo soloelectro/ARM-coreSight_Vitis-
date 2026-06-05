@@ -1,0 +1,157 @@
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity axis_merger_4to1 is
+    port (
+        ACLK    : in  std_logic;
+        ARESETN : in  std_logic;
+
+        -- 4 input AXI-Stream (16-bit)
+        S0_AXIS_tdata  : in  std_logic_vector(15 downto 0);
+        S0_AXIS_tvalid : in  std_logic;
+        S0_AXIS_tready : out std_logic;
+        S0_AXIS_tlast  : in  std_logic;
+
+        S1_AXIS_tdata  : in  std_logic_vector(15 downto 0);
+        S1_AXIS_tvalid : in  std_logic;
+        S1_AXIS_tready : out std_logic;
+        S1_AXIS_tlast  : in  std_logic;
+
+        S2_AXIS_tdata  : in  std_logic_vector(15 downto 0);
+        S2_AXIS_tvalid : in  std_logic;
+        S2_AXIS_tready : out std_logic;
+        S2_AXIS_tlast  : in  std_logic;
+
+        S3_AXIS_tdata  : in  std_logic_vector(15 downto 0);
+        S3_AXIS_tvalid : in  std_logic;
+        S3_AXIS_tready : out std_logic;
+        S3_AXIS_tlast  : in  std_logic;
+
+        -- Output AXI-Stream (32-bit for DMA)
+        M_AXIS_tdata  : out std_logic_vector(31 downto 0);
+        M_AXIS_tvalid : out std_logic;
+        M_AXIS_tready : in  std_logic;
+        M_AXIS_tlast  : out std_logic;
+        M_AXIS_tkeep  : out std_logic_vector(3 downto 0)
+    );
+end entity;
+
+architecture rtl of axis_merger_4to1 is
+
+    type state_type is (IDLE, SEND_PACKET);
+    signal state           : state_type := IDLE;
+    signal current_channel : unsigned(1 downto 0) := (others => '0');
+
+    signal sel_tdata  : std_logic_vector(15 downto 0);
+    signal sel_tvalid : std_logic;
+    signal sel_tlast  : std_logic;
+
+    signal M_tvalid : std_logic := '0';
+    signal M_tlast  : std_logic := '0';
+    signal M_tdata  : std_logic_vector(31 downto 0) := (others => '0');
+
+    signal channel_req : std_logic_vector(3 downto 0);
+    signal handshake   : std_logic;
+
+begin
+
+    -- Channel requests
+    channel_req(0) <= S0_AXIS_tvalid;
+    channel_req(1) <= S1_AXIS_tvalid;
+    channel_req(2) <= S2_AXIS_tvalid;
+    channel_req(3) <= S3_AXIS_tvalid;
+
+    -- Handshake detection
+    handshake <= M_tvalid and M_AXIS_tready;
+
+    -- Input multiplexer
+    with current_channel select sel_tdata <=
+        S0_AXIS_tdata when "00",
+        S1_AXIS_tdata when "01",
+        S2_AXIS_tdata when "10",
+        S3_AXIS_tdata when others;
+
+    with current_channel select sel_tvalid <=
+        S0_AXIS_tvalid when "00",
+        S1_AXIS_tvalid when "01",
+        S2_AXIS_tvalid when "10",
+        S3_AXIS_tvalid when others;
+
+    with current_channel select sel_tlast <=
+        S0_AXIS_tlast when "00",
+        S1_AXIS_tlast when "01",
+        S2_AXIS_tlast when "10",
+        S3_AXIS_tlast when others;
+
+    -- Backpressure to inputs
+    S0_AXIS_tready <= M_AXIS_tready when
+        (state = SEND_PACKET and current_channel = "00")
+        else '0';
+    S1_AXIS_tready <= M_AXIS_tready when
+        (state = SEND_PACKET and current_channel = "01")
+        else '0';
+    S2_AXIS_tready <= M_AXIS_tready when
+        (state = SEND_PACKET and current_channel = "10")
+        else '0';
+    S3_AXIS_tready <= M_AXIS_tready when
+        (state = SEND_PACKET and current_channel = "11")
+        else '0';
+
+    -- State machine
+    process(ACLK)
+        variable prio : integer;
+        variable idx  : integer;
+    begin
+        if rising_edge(ACLK) then
+            if ARESETN = '0' then
+                state           <= IDLE;
+                current_channel <= (others => '0');
+                M_tvalid        <= '0';
+                M_tlast         <= '0';
+                M_tdata         <= (others => '0');
+            else
+                case state is
+
+                    when IDLE =>
+                        M_tvalid <= '0';
+                        M_tlast  <= '0';
+                        -- Round robin find next channel
+                        prio := to_integer(current_channel);
+                        for i in 1 to 4 loop
+                            idx := (prio + i) mod 4;
+                            if channel_req(idx) = '1' then
+                                current_channel <=
+                                    to_unsigned(idx, 2);
+                                state <= SEND_PACKET;
+                                exit;
+                            end if;
+                        end loop;
+
+                    when SEND_PACKET =>
+                        -- FIX: correct tdata padding
+                        M_tdata  <= x"0000" & sel_tdata;
+                        M_tvalid <= sel_tvalid;
+                        M_tlast  <= sel_tlast;
+
+                        -- End of packet
+                        if sel_tlast = '1' and
+                           handshake = '1' then
+                            state    <= IDLE;
+                            M_tvalid <= '0';
+                            M_tlast  <= '0';
+                        end if;
+
+                end case;
+            end if;
+        end if;
+    end process;
+
+    -- Output connections
+    M_AXIS_tdata  <= M_tdata;
+    M_AXIS_tvalid <= M_tvalid;
+    M_AXIS_tlast  <= M_tlast;
+    -- FIX: tkeep all bytes valid
+    M_AXIS_tkeep  <= "1111";
+
+end architecture;
