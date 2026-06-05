@@ -1,4 +1,5 @@
-<img width="466" height="269" alt="image" src="https://github.com/user-attachments/assets/6d726376-5e40-4616-bd75-3dbf89770ebd" />
+<img width="703" height="398" alt="image" src="https://github.com/user-attachments/assets/dc109514-195c-4dad-baee-916ee7c91d4b" />
+
 
 Multi-Source Trace Processing System (FPGA)
 This diagram shows the high-level structure of the system.  
