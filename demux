@@ -1,0 +1,145 @@
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+
+entity demux is
+    generic (
+        -- Source IDs for each output
+        -- Change these for different boards!
+        -- Zedboard: PTM0=1, PTM1=2
+        -- US+:      ETM0=1, ETM1=2, ETM2=3, ETM3=4
+        ID_OUT0 : std_logic_vector(6 downto 0) := "0000001";  -- ID=1
+        ID_OUT1 : std_logic_vector(6 downto 0) := "0000010";  -- ID=2
+        ID_OUT2 : std_logic_vector(6 downto 0) := "0000011";  -- ID=3
+        ID_OUT3 : std_logic_vector(6 downto 0) := "0000100"   -- ID=4
+    );
+    port (
+        ACLK    : in  std_logic;
+        ARESETN : in  std_logic;
+
+        -- Inputs from frame_decoder
+        Chan0       : in  std_logic_vector(15 downto 0);
+        Chan0_valid : in  std_logic;
+        Chan1       : in  std_logic_vector(15 downto 0);
+        Chan1_valid : in  std_logic;
+        Chan2       : in  std_logic_vector(15 downto 0);
+        Chan2_valid : in  std_logic;
+        Chan3       : in  std_logic_vector(15 downto 0);
+        Chan3_valid : in  std_logic;
+
+        -- Outputs separated by source ID
+        Out0        : out std_logic_vector(15 downto 0);
+        Out0_valid  : out std_logic;
+        Out1        : out std_logic_vector(15 downto 0);
+        Out1_valid  : out std_logic;
+        Out2        : out std_logic_vector(15 downto 0);
+        Out2_valid  : out std_logic;
+        Out3        : out std_logic_vector(15 downto 0);
+        Out3_valid  : out std_logic
+    );
+end entity;
+
+architecture rtl of demux is
+
+    -- Helper procedure to route one channel
+    procedure route(
+        data       : in  std_logic_vector(15 downto 0);
+        id         : in  std_logic_vector(6 downto 0);
+        signal o0  : out std_logic_vector(15 downto 0);
+        signal v0  : out std_logic;
+        signal o1  : out std_logic_vector(15 downto 0);
+        signal v1  : out std_logic;
+        signal o2  : out std_logic_vector(15 downto 0);
+        signal v2  : out std_logic;
+        signal o3  : out std_logic_vector(15 downto 0);
+        signal v3  : out std_logic
+    ) is
+    begin
+        if id = ID_OUT0 then
+            o0 <= data; v0 <= '1';
+        elsif id = ID_OUT1 then
+            o1 <= data; v1 <= '1';
+        elsif id = ID_OUT2 then
+            o2 <= data; v2 <= '1';
+        elsif id = ID_OUT3 then
+            o3 <= data; v3 <= '1';
+        end if;
+    end procedure;
+
+    signal id0, id1, id2, id3 : std_logic_vector(6 downto 0);
+
+begin
+
+    -- Extract IDs
+    id0 <= Chan0(6 downto 0);
+    id1 <= Chan1(6 downto 0);
+    id2 <= Chan2(6 downto 0);
+    id3 <= Chan3(6 downto 0);
+
+    process(ACLK)
+    begin
+        if rising_edge(ACLK) then
+            if ARESETN = '0' then
+                Out0 <= (others => '0'); Out0_valid <= '0';
+                Out1 <= (others => '0'); Out1_valid <= '0';
+                Out2 <= (others => '0'); Out2_valid <= '0';
+                Out3 <= (others => '0'); Out3_valid <= '0';
+            else
+                -- Default clear all valids
+                Out0_valid <= '0';
+                Out1_valid <= '0';
+                Out2_valid <= '0';
+                Out3_valid <= '0';
+
+                -- Route each channel
+                if Chan0_valid = '1' then
+                    if id0 = ID_OUT0 then
+                        Out0 <= Chan0; Out0_valid <= '1';
+                    elsif id0 = ID_OUT1 then
+                        Out1 <= Chan0; Out1_valid <= '1';
+                    elsif id0 = ID_OUT2 then
+                        Out2 <= Chan0; Out2_valid <= '1';
+                    elsif id0 = ID_OUT3 then
+                        Out3 <= Chan0; Out3_valid <= '1';
+                    end if;
+                end if;
+
+                if Chan1_valid = '1' then
+                    if id1 = ID_OUT0 then
+                        Out0 <= Chan1; Out0_valid <= '1';
+                    elsif id1 = ID_OUT1 then
+                        Out1 <= Chan1; Out1_valid <= '1';
+                    elsif id1 = ID_OUT2 then
+                        Out2 <= Chan1; Out2_valid <= '1';
+                    elsif id1 = ID_OUT3 then
+                        Out3 <= Chan1; Out3_valid <= '1';
+                    end if;
+                end if;
+
+                if Chan2_valid = '1' then
+                    if id2 = ID_OUT0 then
+                        Out0 <= Chan2; Out0_valid <= '1';
+                    elsif id2 = ID_OUT1 then
+                        Out1 <= Chan2; Out1_valid <= '1';
+                    elsif id2 = ID_OUT2 then
+                        Out2 <= Chan2; Out2_valid <= '1';
+                    elsif id2 = ID_OUT3 then
+                        Out3 <= Chan2; Out3_valid <= '1';
+                    end if;
+                end if;
+
+                if Chan3_valid = '1' then
+                    if id3 = ID_OUT0 then
+                        Out0 <= Chan3; Out0_valid <= '1';
+                    elsif id3 = ID_OUT1 then
+                        Out1 <= Chan3; Out1_valid <= '1';
+                    elsif id3 = ID_OUT2 then
+                        Out2 <= Chan3; Out2_valid <= '1';
+                    elsif id3 = ID_OUT3 then
+                        Out3 <= Chan3; Out3_valid <= '1';
+                    end if;
+                end if;
+
+            end if;
+        end if;
+    end process;
+end architecture;
