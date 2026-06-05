@@ -1,0 +1,144 @@
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity trace_analyzer is
+    port (
+        ACLK      : in  std_logic;
+        ARESETN   : in  std_logic;
+
+        -- Input from protocol_decoder
+        Data_in    : in  std_logic_vector(7 downto 0);
+        ID_in      : in  std_logic_vector(6 downto 0);
+        Valid_in   : in  std_logic;
+
+        -- Optional trigger
+        Trigger_in : in  std_logic;
+
+        -- AXI Stream output
+        M_AXIS_tdata  : out std_logic_vector(15 downto 0);
+        M_AXIS_tvalid : out std_logic;
+        M_AXIS_tready : in  std_logic;
+        M_AXIS_tlast  : out std_logic;
+
+        -- Status
+        Overflow   : out std_logic;
+        Triggered  : out std_logic;
+        Data_count : out std_logic_vector(15 downto 0)
+    );
+end entity;
+
+architecture rtl of trace_analyzer is
+
+    constant FIFO_DEPTH : integer := 1024;
+    constant PTR_WIDTH  : integer := 10;
+
+    type fifo_array is array (0 to FIFO_DEPTH-1)
+        of std_logic_vector(15 downto 0);
+    signal fifo_mem : fifo_array;
+
+    signal wr_ptr : unsigned(PTR_WIDTH-1 downto 0) := (others => '0');
+    signal rd_ptr : unsigned(PTR_WIDTH-1 downto 0) := (others => '0');
+    signal count  : unsigned(PTR_WIDTH downto 0)   := (others => '0');
+
+    signal fifo_full  : std_logic;
+    signal fifo_empty : std_logic;
+
+    -- FIX 1: always capture immediately
+    signal capture_active   : std_logic := '1';
+    signal trigger_detected : std_logic := '0';
+    signal trigger_prev     : std_logic := '0';
+
+    signal packed_data : std_logic_vector(15 downto 0);
+
+begin
+
+    -- Pack: [Data(7:0) | '0' | ID(6:0)]
+    packed_data <= Data_in & '0' & ID_in;
+
+    fifo_full  <= '1' when count = FIFO_DEPTH else '0';
+    fifo_empty <= '1' when count = 0 else '0';
+
+    Overflow   <= '1' when (Valid_in = '1' and
+                            capture_active = '1' and
+                            fifo_full = '1') else '0';
+    Triggered  <= trigger_detected;
+    Data_count <= std_logic_vector(resize(count, 16));
+
+    -- FIX 2: tlast when last word in FIFO
+    M_AXIS_tlast <= '1' when count = 1 else '0';
+
+    -- Trigger detection
+    process(ACLK)
+    begin
+        if rising_edge(ACLK) then
+            if ARESETN = '0' then
+                trigger_detected <= '0';
+                trigger_prev     <= '0';
+                capture_active   <= '1';
+            else
+                if Trigger_in = '1' and trigger_prev = '0' then
+                    trigger_detected <= '1';
+                end if;
+                trigger_prev <= Trigger_in;
+            end if;
+        end if;
+    end process;
+
+    -- FIFO write
+    process(ACLK)
+    begin
+        if rising_edge(ACLK) then
+            if ARESETN = '0' then
+                wr_ptr <= (others => '0');
+            elsif Valid_in = '1' and
+                  capture_active = '1' and
+                  fifo_full = '0' then
+                fifo_mem(to_integer(wr_ptr)) <= packed_data;
+                wr_ptr <= wr_ptr + 1;
+            end if;
+        end if;
+    end process;
+
+    -- FIFO read
+    process(ACLK)
+    begin
+        if rising_edge(ACLK) then
+            if ARESETN = '0' then
+                rd_ptr <= (others => '0');
+            elsif M_AXIS_tready = '1' and
+                  fifo_empty = '0' then
+                rd_ptr <= rd_ptr + 1;
+            end if;
+        end if;
+    end process;
+
+    -- FIFO count
+    process(ACLK)
+        variable write_en : boolean;
+        variable read_en  : boolean;
+    begin
+        if rising_edge(ACLK) then
+            if ARESETN = '0' then
+                count <= (others => '0');
+            else
+                write_en := (Valid_in = '1' and
+                             capture_active = '1' and
+                             fifo_full = '0');
+                read_en  := (M_AXIS_tready = '1' and
+                             fifo_empty = '0');
+
+                if write_en and not read_en then
+                    count <= count + 1;
+                elsif read_en and not write_en then
+                    count <= count - 1;
+                end if;
+            end if;
+        end if;
+    end process;
+
+    -- AXI Stream outputs
+    M_AXIS_tdata  <= fifo_mem(to_integer(rd_ptr));
+    M_AXIS_tvalid <= not fifo_empty;
+
+end architecture;
