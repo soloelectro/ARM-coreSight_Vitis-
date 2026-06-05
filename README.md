@@ -14,8 +14,7 @@ It captures trace data, processes it through multiple decoding and analysis stag
 
 Full Block Design (Vivado)
 System Architecture
-<img width="487" height="195" alt="image" src="https://github.com/user-attachments/assets/7ed78ef3-8b31-4b0a-b3de-a74a296d7e19" />
-<img width="485" height="228" alt="image" src="https://github.com/user-attachments/assets/7b16254b-7877-46d0-aa4c-1edb8abf4bfc" />
+<img width="487" height="195" alt="image" src="https://github.com/user-attachments/assets/7ed78ef3-8b31-4b0a-b3de-a74a296d7e19" /> <img width="485" height="228" alt="image" src="https://github.com/user-attachments/assets/7b16254b-7877-46d0-aa4c-1edb8abf4bfc" />
 
 
 This is the complete Vivado block design of the system, showing all IP cores, interconnections, and AXI interfaces.
