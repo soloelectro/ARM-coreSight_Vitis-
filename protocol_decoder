@@ -1,0 +1,43 @@
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+
+entity protocol_decoder is
+    port (
+        ACLK      : in  std_logic;
+        ARESETN   : in  std_logic;
+
+        -- Input from demux
+        -- Format: [Data(15:8) | '0'(7) | ID(6:0)]
+        Data_in   : in  std_logic_vector(15 downto 0);
+        Valid_in  : in  std_logic;
+
+        -- Output to trace_analyzer
+        Data_out  : out std_logic_vector(7 downto 0);
+        ID_out    : out std_logic_vector(6 downto 0);
+        Valid_out : out std_logic
+    );
+end entity;
+
+architecture rtl of protocol_decoder is
+begin
+    process(ACLK)
+    begin
+        if rising_edge(ACLK) then
+            if ARESETN = '0' then
+                Data_out  <= (others => '0');
+                ID_out    <= (others => '0');
+                Valid_out <= '0';
+            else
+                if Valid_in = '1' then
+                    -- Extract fields
+                    Data_out  <= Data_in(15 downto 8);
+                    ID_out    <= Data_in(6 downto 0);
+                    Valid_out <= '1';
+                else
+                    -- FIX: clear valid when no data
+                    Valid_out <= '0';
+                end if;
+            end if;
+        end if;
+    end process;
+end architecture;
